@@ -40,6 +40,8 @@ def parse_args():
                    help="Hide the annotated camera preview window")
     p.add_argument("--calibrate",   action="store_true",
                    help="Run calibration on startup")
+    p.add_argument("--rekognition", action="store_true",
+                   help="Use Amazon Rekognition for high-accuracy face detection")
     return p.parse_args()
 
 
@@ -68,7 +70,7 @@ def main():
     print("[main] Camera ready.")
 
     # ── Components ────────────────────────────────────────────
-    detector    = GazeDetector()
+    detector    = GazeDetector(use_rekognition=args.rekognition)
     controller  = ScreenController()
     overlay     = StatusOverlay()
 
