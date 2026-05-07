@@ -134,16 +134,19 @@ def preprocess(path, label):
     img   = tf.keras.applications.mobilenet_v2.preprocess_input(img)
     return img, label
 
+# Instantiate augmentation layers once (outside the tf.data pipeline)
+# to avoid variable creation errors during ds.map()
+rotation_layer = tf.keras.layers.RandomRotation(AUG_ROTATION, seed=SEED)
+zoom_layer     = tf.keras.layers.RandomZoom(AUG_ZOOM, seed=SEED)
+
 def augment(img, label):
     """Light augmentation – applied only during training."""
     img = tf.image.random_flip_left_right(img)
     img = tf.image.random_brightness(img, max_delta=AUG_BRIGHTNESS)
     img = tf.image.random_contrast(img, 0.85, 1.15)
-    # Random rotation via keras layer (wrapped in py_function for compat)
-    img = tf.keras.layers.RandomRotation(AUG_ROTATION, seed=SEED)(
-        tf.expand_dims(img, 0))[0]
-    img = tf.keras.layers.RandomZoom(AUG_ZOOM, seed=SEED)(
-        tf.expand_dims(img, 0))[0]
+    # Apply keras layers (need [0] because they expect/return batch dimension)
+    img = rotation_layer(tf.expand_dims(img, 0))[0]
+    img = zoom_layer(tf.expand_dims(img, 0))[0]
     return img, label
 
 AUTOTUNE = tf.data.AUTOTUNE
