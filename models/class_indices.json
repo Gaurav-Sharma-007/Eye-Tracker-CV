@@ -1,0 +1,16 @@
+{
+  "class_to_idx": {
+    "down": 0,
+    "left": 1,
+    "right": 2,
+    "straight": 3,
+    "up": 4
+  },
+  "idx_to_class": {
+    "0": "down",
+    "1": "left",
+    "2": "right",
+    "3": "straight",
+    "4": "up"
+  }
+}
