@@ -35,11 +35,13 @@ Usage (called from gaze_detector.py)
 """
 
 import io
+import os
 import cv2
 import numpy as np
 
 try:
     import boto3
+    from botocore.config import Config
     BOTO3_AVAILABLE = True
 except ImportError:
     BOTO3_AVAILABLE = False
@@ -54,20 +56,41 @@ class RekognitionFaceDetector:
     credentials are missing.
     """
 
-    def __init__(self, region: str = "us-east-1"):
+    def __init__(self, region: str | None = None):
         self._client = None
         self._available = False
+        self._region = None
 
         if not BOTO3_AVAILABLE:
-            print("[rekognition] boto3 not installed – face detection disabled.")
+            print("[rekognition] boto3 not installed - face detection disabled.")
             return
 
         try:
-            self._client = boto3.client("rekognition", region_name=region)
-            # Quick connectivity test
-            self._client.list_collections(MaxResults=1)
+            session = boto3.session.Session()
+            credentials = session.get_credentials()
+            if credentials is None:
+                print("[rekognition] AWS credentials not found - face detection disabled.")
+                return
+
+            resolved_region = (
+                region
+                or session.region_name
+                or os.getenv("AWS_DEFAULT_REGION")
+                or os.getenv("AWS_REGION")
+                or "us-east-1"
+            )
+            self._client = session.client(
+                "rekognition",
+                region_name=resolved_region,
+                config=Config(
+                    connect_timeout=2,
+                    read_timeout=5,
+                    retries={"max_attempts": 2},
+                ),
+            )
             self._available = True
-            print(f"[rekognition] Connected (region={region})")
+            self._region = resolved_region
+            print(f"[rekognition] Configured (region={resolved_region})")
         except Exception as e:
             print(f"[rekognition] Not available ({type(e).__name__}): {e}")
             print("[rekognition] Falling back to OpenCV Haar cascades.")

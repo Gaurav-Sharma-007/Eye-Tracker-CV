@@ -127,6 +127,12 @@ python main.py --calibrate
 
 # Use Amazon Rekognition for face/eye landmarks before CNN inference
 python main.py --rekognition
+
+# Override the AWS region for Rekognition
+python main.py --rekognition --rekognition-region us-east-1
+
+# Reduce Rekognition refresh frequency if your network is slow
+python main.py --rekognition --rekognition-interval 1.5
 ```
 
 ### Keyboard Shortcuts
@@ -251,3 +257,8 @@ experimentation, grouped by direction.
   OpenCV gaze detection automatically.
 - If Rekognition is requested but unavailable, the detector falls back to OpenCV
   face detection.
+- Rekognition uses your AWS configured/default region unless
+  `--rekognition-region` is provided.
+- Rekognition runs asynchronously and is throttled so cloud latency does not
+  block the live camera loop. Increase `--rekognition-interval` on slow
+  networks, or omit `--rekognition` for fully local real-time tracking.

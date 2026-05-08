@@ -23,6 +23,8 @@ import numpy as np
 import os
 import json
 import collections
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 # ─────────────────────────────────────────────────────────────
 # Optional imports (graceful degradation)
@@ -148,13 +150,23 @@ class GazeDetector:
 
     # CNN confidence smoothing buffer length
     CNN_SMOOTH   = 5
+    DEFAULT_REKO_INTERVAL_S = 0.75
+    REKO_CACHE_TTL_S = 2.5
 
-    def __init__(self, use_rekognition: bool = False):
+    def __init__(self, use_rekognition: bool = False,
+                 rekognition_region: str | None = None,
+                 rekognition_interval: float | None = None):
         cfg = _cfg.load()
         self.UP_THRESH    = cfg["up_thresh"]
         self.DOWN_THRESH  = cfg["down_thresh"]
         self.LEFT_THRESH  = cfg.get("left_thresh",  0.38)
         self.RIGHT_THRESH = cfg.get("right_thresh", 0.62)
+        self._reko_interval_s = max(
+            0.1,
+            rekognition_interval
+            if rekognition_interval is not None
+            else self.DEFAULT_REKO_INTERVAL_S,
+        )
 
         # ── Haar cascades (used in Mode B AND as fallback face detector) ──
         self.face_cascade = cv2.CascadeClassifier(FACE_CASCADE_PATH)
@@ -186,12 +198,22 @@ class GazeDetector:
 
         # ── Optional Rekognition for face crop ────────────────────────────
         self._reko = None
+        self._reko_executor = None
+        self._reko_future = None
+        self._reko_last_request = 0.0
+        self._reko_last_result = None
         if use_rekognition and self._mode == "A":
             try:
                 from rekognition_face import RekognitionFaceDetector
-                self._reko = RekognitionFaceDetector()
+                self._reko = RekognitionFaceDetector(region=rekognition_region)
                 if not self._reko.available:
                     self._reko = None
+                else:
+                    self._reko_executor = ThreadPoolExecutor(max_workers=1)
+                    print(
+                        "[detector] Rekognition async mode "
+                        f"({self._reko_interval_s:.2f}s throttle)"
+                    )
             except ImportError:
                 pass
 
@@ -229,6 +251,56 @@ class GazeDetector:
         else:
             return self._process_classic(frame)
 
+    def close(self):
+        if self._reko_executor is not None:
+            self._reko_executor.shutdown(wait=False, cancel_futures=True)
+            self._reko_executor = None
+
+    def _detect_face_haar(self, frame: np.ndarray, debug: np.ndarray):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.equalizeHist(gray)
+        faces = self.face_cascade.detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=5, minSize=(100, 100)
+        )
+        if len(faces) == 0:
+            return None
+
+        face_box = max(faces, key=lambda r: r[2] * r[3])
+        fx, fy, fw, fh = face_box
+        cv2.rectangle(debug, (fx, fy), (fx + fw, fy + fh), (0, 200, 0), 2)
+        return face_box
+
+    def _poll_rekognition(self, frame: np.ndarray):
+        now = time.time()
+
+        if self._reko_future is not None and self._reko_future.done():
+            try:
+                face_box, landmarks = self._reko_future.result()
+                if face_box is not None:
+                    self._reko_last_result = (face_box, landmarks, now)
+            except Exception as e:
+                print(f"[rekognition] Async detect failed: {e}")
+            finally:
+                self._reko_future = None
+
+        if (
+            self._reko_executor is not None
+            and self._reko_future is None
+            and now - self._reko_last_request >= self._reko_interval_s
+        ):
+            self._reko_last_request = now
+            self._reko_future = self._reko_executor.submit(
+                self._reko.detect, frame.copy()
+            )
+
+        if self._reko_last_result is None:
+            return None, {}
+
+        face_box, landmarks, detected_at = self._reko_last_result
+        if now - detected_at > self.REKO_CACHE_TTL_S:
+            return None, {}
+        return face_box, landmarks
+
     # ── Mode A – CNN ──────────────────────────────────────────────────────
 
     def _process_cnn(self, frame: np.ndarray):
@@ -241,20 +313,16 @@ class GazeDetector:
         landmarks = {}
 
         if self._reko is not None:
-            face_box, landmarks = self._reko.detect(frame)
+            face_box, landmarks = self._poll_rekognition(frame)
             if face_box:
                 fx, fy, fw, fh = face_box
                 cv2.rectangle(debug, (fx, fy), (fx+fw, fy+fh), (0, 200, 255), 2)
+                cv2.putText(debug, "Rekognition async", (10, h - 15),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 255), 1)
+            else:
+                face_box = self._detect_face_haar(frame, debug)
         else:
-            gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            gray  = cv2.equalizeHist(gray)
-            faces = self.face_cascade.detectMultiScale(
-                gray, scaleFactor=1.1, minNeighbors=5, minSize=(100, 100)
-            )
-            if len(faces) > 0:
-                face_box = max(faces, key=lambda r: r[2]*r[3])
-                fx, fy, fw, fh = face_box
-                cv2.rectangle(debug, (fx, fy), (fx+fw, fy+fh), (0, 200, 0), 2)
+            face_box = self._detect_face_haar(frame, debug)
 
         if face_box is None:
             cv2.putText(debug, "No face", (10, 30),
@@ -325,16 +393,15 @@ class GazeDetector:
             cv2.rectangle(debug, (x1, y1), (x2, y2), (0, 100, 255), 1)
 
         # ── 3. CNN Inference (Average over eye crops) ──────────────
-        all_probs = []
+        batch = []
         for ec in eye_crops:
             inp = cv2.resize(ec, (IMG_W, IMG_H))
             inp = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB).astype(np.float32)
             inp = tf.keras.applications.mobilenet_v2.preprocess_input(inp)
-            inp = np.expand_dims(inp, 0)
-            probs = self._cnn_model.predict(inp, verbose=0)[0]
-            all_probs.append(probs)
+            batch.append(inp)
 
-        avg_probs = np.mean(all_probs, axis=0)
+        probs = self._cnn_model.predict(np.asarray(batch), verbose=0)
+        avg_probs = np.mean(probs, axis=0)
         pred_idx  = int(np.argmax(avg_probs))
         confidence = float(avg_probs[pred_idx])
 

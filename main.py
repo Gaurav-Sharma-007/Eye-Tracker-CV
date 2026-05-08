@@ -20,11 +20,6 @@ import argparse
 import time
 import sys
 
-from gaze_detector   import GazeDetector, GazeDirection
-from screen_controller import ScreenController
-from calibration     import Calibrator
-from overlay         import StatusOverlay
-
 
 # ─────────────────────────────────────────────────────────────
 # CLI
@@ -42,6 +37,10 @@ def parse_args():
                    help="Run calibration on startup")
     p.add_argument("--rekognition", action="store_true",
                    help="Use Amazon Rekognition for high-accuracy face detection")
+    p.add_argument("--rekognition-region", default=None,
+                   help="AWS region for Rekognition (defaults to AWS config/env)")
+    p.add_argument("--rekognition-interval", type=float, default=None,
+                   help="Seconds between Rekognition calls (default 0.75)")
     return p.parse_args()
 
 
@@ -55,6 +54,11 @@ PREVIEW_WIN = "Eye Tracker – Camera Preview"
 def main():
     args = parse_args()
 
+    from gaze_detector import GazeDetector, GazeDirection
+    from screen_controller import ScreenController
+    from calibration import Calibrator
+    from overlay import StatusOverlay
+
     # ── Camera ────────────────────────────────────────────────
     print(f"[main] Opening camera {args.camera} …")
     cam = cv2.VideoCapture(args.camera)
@@ -66,11 +70,16 @@ def main():
     cam.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
     cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     cam.set(cv2.CAP_PROP_FPS, 30)
+    cam.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     print("[main] Camera ready.")
 
     # ── Components ────────────────────────────────────────────
-    detector    = GazeDetector(use_rekognition=args.rekognition)
+    detector    = GazeDetector(
+        use_rekognition=args.rekognition,
+        rekognition_region=args.rekognition_region,
+        rekognition_interval=args.rekognition_interval,
+    )
     controller  = ScreenController()
     overlay     = StatusOverlay()
 
@@ -153,6 +162,7 @@ def main():
             print(f"[main] Scroll amount → {sc.SCROLL_AMOUNT}")
 
     # ── Cleanup ───────────────────────────────────────────────
+    detector.close()
     cam.release()
     overlay.close()
     cv2.destroyAllWindows()
