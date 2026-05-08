@@ -47,8 +47,14 @@ EYE_CASCADE_PATH     = _cv2_data_path("haarcascade_eye_tree_eyeglasses.xml")
 EYE_CASCADE_FALLBACK = _cv2_data_path("haarcascade_eye.xml")
 
 MODEL_DIR   = os.path.join(os.path.dirname(__file__), "models")
-MODEL_PATH  = os.path.join(MODEL_DIR, "gaze_model.keras")
 IDX_PATH    = os.path.join(MODEL_DIR, "class_indices.json")
+
+# Prefer best checkpoint; fall back to final saved model
+_CANDIDATE_MODELS = [
+    os.path.join(MODEL_DIR, "best_gaze_model.keras"),
+    os.path.join(MODEL_DIR, "gaze_model.keras"),
+]
+MODEL_PATH = next((p for p in _CANDIDATE_MODELS if os.path.exists(p)), _CANDIDATE_MODELS[-1])
 
 IMG_H, IMG_W = 224, 224
 
@@ -168,8 +174,10 @@ class GazeDetector:
                     data = json.load(f)
                 self._idx_to_class = data["idx_to_class"]
                 self._mode = "A"
-                print(f"[detector] Mode A – CNN model loaded from {MODEL_PATH}")
+                model_name = os.path.basename(MODEL_PATH)
+                print(f"[detector] Mode A – CNN model loaded: {model_name}")
                 print(f"[detector] Classes: {list(self._idx_to_class.values())}")
+                print(f"[detector] Input shape: {self._cnn_model.input_shape}")
             except Exception as e:
                 print(f"[detector] Could not load CNN model ({e}) – falling back to Mode B")
 
