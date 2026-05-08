@@ -235,74 +235,137 @@ class GazeDetector:
         debug = frame.copy()
         h, w  = frame.shape[:2]
 
-        # ── Face detection ────────────────────────────────────────────────
+        # ── 1. Detect Face ───────────────────────────────────────────
+        face_box = None
         face_crop = None
-        face_box  = None
+        landmarks = {}
 
         if self._reko is not None:
-            # Use Rekognition for high-accuracy face + eye landmarks
-            box, landmarks = self._reko.detect(frame)
-            if box is not None:
-                face_box  = box
-                fx, fy, fw, fh = box
+            face_box, landmarks = self._reko.detect(frame)
+            if face_box:
+                fx, fy, fw, fh = face_box
                 cv2.rectangle(debug, (fx, fy), (fx+fw, fy+fh), (0, 200, 255), 2)
-                cv2.putText(debug, "Rekognition", (fx, fy-6),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
-
-                # Prefer eye-region crop for the CNN
-                eye_crop = self._reko.eye_region_from_landmarks(frame, landmarks)
-                face_crop = eye_crop if eye_crop is not None else frame[fy:fy+fh, fx:fx+fw]
         else:
-            # Fall back to Haar cascade face detection
             gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             gray  = cv2.equalizeHist(gray)
             faces = self.face_cascade.detectMultiScale(
-                gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80)
+                gray, scaleFactor=1.1, minNeighbors=5, minSize=(100, 100)
             )
             if len(faces) > 0:
-                face_box   = max(faces, key=lambda r: r[2]*r[3])
+                face_box = max(faces, key=lambda r: r[2]*r[3])
                 fx, fy, fw, fh = face_box
                 cv2.rectangle(debug, (fx, fy), (fx+fw, fy+fh), (0, 200, 0), 2)
-                face_crop  = frame[fy:fy+fh, fx:fx+fw]
 
-        if face_crop is None or face_crop.size == 0:
+        if face_box is None:
             cv2.putText(debug, "No face", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
             return GazeDirection.UNKNOWN, debug, None
 
-        # ── CNN inference ─────────────────────────────────────────────────
-        inp = cv2.resize(face_crop, (IMG_W, IMG_H))
-        inp = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB).astype(np.float32)
-        inp = tf.keras.applications.mobilenet_v2.preprocess_input(inp)
-        inp = np.expand_dims(inp, 0)
+        # ── 2. Extract Eye Crops ─────────────────────────────────────
+        # The model was trained on tight eye crops (approx 224x224 after resize).
+        # We try to extract both eyes, flip the right eye to match the left-eye template.
+        eye_crops = []
+        fx, fy, fw, fh = face_box
+        
+        if landmarks.get("left_eye") and landmarks.get("right_eye"):
+            # Use high-accuracy landmarks from Rekognition
+            for side in ["right_eye", "left_eye"]:
+                ex, ey = landmarks[side]
+                # Define a crop around the eye (approx 0.5x face width)
+                # Training data includes the eyebrow, so we shift the crop slightly up.
+                ew = int(fw * 0.45)
+                eh = ew
+                ex1, ey1 = max(0, ex - ew//2), max(0, ey - int(eh * 0.6))
+                ex2, ey2 = min(w, ex1 + ew), min(h, ey1 + eh)
+                crop = frame[ey1:ey2, ex1:ex2]
+                if crop.size > 0:
+                    # Flip the person's right eye (left side of image) to look like a left eye
+                    if side == "right_eye":
+                        crop = cv2.flip(crop, 1)
+                    eye_crops.append(crop)
+                    cv2.rectangle(debug, (ex1, ey1), (ex2, ey2), (255, 255, 0), 1)
+        else:
+            # Fall back to Haar eye detection
+            face_gray = cv2.cvtColor(frame[fy:fy+fh, fx:fx+fw], cv2.COLOR_BGR2GRAY)
+            eye_roi_h = int(fh * 0.5)
+            eyes = self.eye_cascade.detectMultiScale(
+                face_gray[:eye_roi_h, :], scaleFactor=1.1, minNeighbors=5
+            )
+            
+            # Filter and sort eyes by X position
+            eyes = sorted([e for e in eyes if e[2] > fw*0.15], key=lambda e: e[0])
+            for i, (ex, ey, ew_e, eh_e) in enumerate(eyes[:2]):
+                # Expand the eye box to match training context (include eyebrow)
+                span = int(ew_e * 1.8)
+                cx, cy = fx + ex + ew_e//2, fy + ey + eh_e//2
+                x1, y1 = max(0, cx - span//2), max(0, cy - int(span * 0.55))
+                x2, y2 = min(w, x1 + span), min(h, y1 + span)
+                crop = frame[y1:y2, x1:x2]
+                if crop.size > 0:
+                    # Decide if we should flip (to match left-eye training template)
+                    should_flip = False
+                    if len(eyes) > 1:
+                        if i == 0: should_flip = True
+                    else:
+                        # If only one eye, check if it's on the left side of the face
+                        if ex < fw * 0.4: should_flip = True
+                        
+                    if should_flip:
+                        crop = cv2.flip(crop, 1)
+                    eye_crops.append(crop)
+                    cv2.rectangle(debug, (x1, y1), (x2, y2), (255, 255, 0), 1)
 
-        probs = self._cnn_model.predict(inp, verbose=0)[0]
-        pred_idx  = int(np.argmax(probs))
-        confidence = float(probs[pred_idx])
+        # Fallback if no eyes found: just take the top half of face as a single crop
+        if not eye_crops:
+            span = int(fw * 0.8)
+            cx, cy = fx + fw//2, fy + fh//3
+            x1, y1 = max(0, cx - span//2), max(0, cy - int(span * 0.5))
+            x2, y2 = min(w, x1 + span), min(h, y1 + span)
+            eye_crops = [frame[y1:y2, x1:x2]]
+            cv2.rectangle(debug, (x1, y1), (x2, y2), (0, 100, 255), 1)
+
+        # ── 3. CNN Inference (Average over eye crops) ──────────────
+        all_probs = []
+        for ec in eye_crops:
+            inp = cv2.resize(ec, (IMG_W, IMG_H))
+            inp = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB).astype(np.float32)
+            inp = tf.keras.applications.mobilenet_v2.preprocess_input(inp)
+            inp = np.expand_dims(inp, 0)
+            probs = self._cnn_model.predict(inp, verbose=0)[0]
+            all_probs.append(probs)
+
+        avg_probs = np.mean(all_probs, axis=0)
+        pred_idx  = int(np.argmax(avg_probs))
+        confidence = float(avg_probs[pred_idx])
 
         self._pred_buffer.append(pred_idx)
 
         # Majority vote over buffer
         counts = collections.Counter(self._pred_buffer)
         voted_idx = counts.most_common(1)[0][0]
-        raw_class = self._idx_to_class.get(str(voted_idx), "unknown")
+        raw_class = self._idx_to_class.get(str(voted_idx), "unknown").lower()
 
-        # Map "straight" → "center"
-        direction = "center" if raw_class == "straight" else raw_class
+        # Map "straight" or others to GazeDirection constants
+        if raw_class == "straight":
+            direction = GazeDirection.CENTER
+        elif hasattr(GazeDirection, raw_class.upper()):
+            direction = getattr(GazeDirection, raw_class.upper())
+        else:
+            direction = GazeDirection.UNKNOWN
 
-        # ── Debug overlay ─────────────────────────────────────────────────
+        # ── 4. Debug Overlay ──────────────────────────────────────────
         col_map = {
-            "up":      (80, 220,  80),
-            "down":    (80, 100, 220),
-            "left":    (255, 165,  0),
-            "right":   (255, 165,  0),
-            "center":  (200, 200, 200),
-            "unknown": ( 80,  80,  80),
+            GazeDirection.UP:      (80, 220,  80),
+            GazeDirection.DOWN:    (80, 100, 220),
+            GazeDirection.LEFT:    (255, 165,  0),
+            GazeDirection.RIGHT:   (255, 165,  0),
+            GazeDirection.CENTER:  (200, 200, 200),
+            GazeDirection.UNKNOWN: ( 80,  80,  80),
         }
         col = col_map.get(direction, (255, 255, 255))
         cv2.putText(debug, f"CNN: {direction.upper()} ({confidence*100:.0f}%)",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.85, col, 2)
-        cv2.putText(debug, f"Mode A | smooth={self.CNN_SMOOTH}f",
+        cv2.putText(debug, f"Mode A | eyes={len(eye_crops)} | smooth={self.CNN_SMOOTH}f",
                     (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
 
         return direction, debug, None   # gaze_ratios not needed in Mode A
